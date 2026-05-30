@@ -1,7 +1,7 @@
 package top.srcrs;
 
-import com.alibaba.fastjson.JSONArray;
-import com.alibaba.fastjson.JSONObject;
+import com.alibaba.fastjson2.JSONArray;
+import com.alibaba.fastjson2.JSONObject;
 import org.apache.http.HttpEntity;
 import org.apache.http.HttpResponse;
 import org.apache.http.client.HttpClient;
@@ -14,11 +14,7 @@ import org.slf4j.LoggerFactory;
 import top.srcrs.domain.Cookie;
 import top.srcrs.util.Encryption;
 import top.srcrs.util.Request;
-import java.io.BufferedReader;
-import java.io.InputStreamReader;
-import java.net.HttpURLConnection;
-import java.net.URL;
-import java.net.URLEncoder;
+
 import java.util.*;
 import java.util.concurrent.TimeUnit;
 
@@ -35,9 +31,13 @@ public class Run {
     private static final Logger LOGGER = LoggerFactory.getLogger(Run.class);
 
     /**
-     * 获取用户所有关注贴吧
+     * 获取用户所有关注贴吧 - PC端接口，支持分页
      */
-    String LIKE_URL = "https://tieba.baidu.com/mo/q/newmoindex";
+    String LIKE_URL = "https://tieba.baidu.com/favForum";
+    /**
+     * 获取用户所有关注贴吧 - 移动端API接口
+     */
+    String LIKE_URL_MOBILE = "http://c.tieba.baidu.com/c/f/forum/like";
     /**
      * 获取用户的tbs
      */
@@ -47,24 +47,36 @@ public class Run {
      */
     String SIGN_URL = "http://c.tieba.baidu.com/c/c/forum/sign";
 
-    /**
-     * 存储用户所关注的贴吧
-     */
-    private List<String> follow = new ArrayList<>();
-    /**
-     * 签到成功的贴吧列表
-     */
-    private static List<String> success = new ArrayList<>();
+    /** 贴吧客户端固定参数 */
+    private static final Map<String, String> CLIENT_PARAMS = new LinkedHashMap<>();
+    static {
+        CLIENT_PARAMS.put("_client_type", "2");
+        CLIENT_PARAMS.put("_client_version", "9.7.8.0");
+        CLIENT_PARAMS.put("_phone_imei", "000000000000000");
+        CLIENT_PARAMS.put("model", "MI+5");
+        CLIENT_PARAMS.put("net_type", "1");
+    }
 
     /**
-     * 签到失败的贴吧列表
+     * 贴吧信息内部类，存储贴吧名称和ID
      */
-    private static HashSet<String> failed = new HashSet<String>();
+    private static class ForumInfo {
+        final String name;
+        final String id;
+        ForumInfo(String name, String id) {
+            this.name = name;
+            this.id = id;
+        }
+    }
 
     /**
-     * 失效的贴吧列表
+     * 存储用户所关注的贴吧（带ID和名称）
      */
-    private static List<String> invalid = new ArrayList<>();
+    private List<ForumInfo> forums = new ArrayList<>();
+    /**
+     * 仅存储贴吧名称（PC端fallback，无ID时使用）
+     */
+    private List<String> followNames = new ArrayList<>();
 
     /**
      * 用户的tbs
@@ -73,7 +85,23 @@ public class Run {
     /**
      * 用户所关注的贴吧数量
      */
-    private static Integer followNum = 201;
+    private static Integer followNum = 0;
+    /**
+     * 签到成功计数
+     */
+    private int successCount = 0;
+    /**
+     * 已签到计数
+     */
+    private int alreadyCount = 0;
+    /**
+     * 被屏蔽的贴吧计数
+     */
+    private int blockedCount = 0;
+    /**
+     * 签到失败计数
+     */
+    private int errorCount = 0;
 
     public static void main(String[] args) {
         Cookie cookie = Cookie.getInstance();
@@ -86,8 +114,8 @@ public class Run {
         run.getTbs();
         run.getFollow();
         run.runSign();
-        LOGGER.info("共 {} 个贴吧 - 成功: {} - 失败: {} - {} ", followNum, success.size(), followNum - success.size(), failed);
-        LOGGER.info("失效 {} 个贴吧: {} ", invalid.size(), invalid);
+        LOGGER.info("共 {} 个贴吧 - 成功: {} - 已签到: {} - 屏蔽: {} - 失败: {}",
+                followNum, run.successCount, run.alreadyCount, run.blockedCount, run.errorCount);
         if (args.length == 2) {
             run.send(args[1]);
         }
@@ -114,83 +142,296 @@ public class Run {
     }
 
     /**
-     * 获取用户所关注的贴吧列表
+     * 获取用户所关注的贴吧列表 - 尝试PC端 → 移动端 → 后备
      *
      * @author srcrs
      * @Time 2020-10-31
      */
     public void getFollow() {
+        boolean hasForums = false;
+
+        // 阶段1: PC端分页获取
+        LOGGER.info("===== 阶段1: 尝试PC端获取贴吧列表 =====");
         try {
-            JSONObject jsonObject = Request.get(LIKE_URL);
-            LOGGER.info("获取贴吧列表成功");
-            JSONArray jsonArray = jsonObject.getJSONObject("data").getJSONArray("like_forum");
-            followNum = jsonArray.size();
-            // 获取用户所有关注的贴吧
-            for (Object array : jsonArray) {
-                String tiebaName = ((JSONObject) array).getString("forum_name");
-                if ("0".equals(((JSONObject) array).getString("is_sign"))) {
-                    // 将为签到的贴吧加入到 follow 中，待签到
-                    follow.add(tiebaName.replace("+", "%2B"));
-                    // 过滤失效的贴吧
-                    if (Request.isTiebaNotExist(tiebaName)) {
-                        follow.remove(tiebaName);
-                        invalid.add(tiebaName);
-                        failed.add(tiebaName);
+            int page = 1;
+            int perPage = 50;
+            boolean hasMore = true;
+
+            while (hasMore) {
+                String pageUrl = LIKE_URL + "?pn=" + page + "&rn=" + perPage;
+                JSONObject jsonObject = Request.get(pageUrl);
+                LOGGER.info("PC端获取第 {} 页贴吧列表", page);
+
+                JSONArray jsonArray = null;
+                try {
+                    jsonArray = jsonObject.getJSONObject("data").getJSONArray("thread_list");
+                } catch (Exception e) {
+                    try {
+                        jsonArray = jsonObject.getJSONObject("data").getJSONArray("forum_list");
+                    } catch (Exception e2) {
+                        jsonArray = jsonObject.getJSONObject("data").getJSONArray("like_forum");
                     }
+                }
+
+                if (jsonArray == null || jsonArray.isEmpty()) {
+                    hasMore = false;
+                    break;
+                }
+
+                for (Object array : jsonArray) {
+                    JSONObject obj = (JSONObject) array;
+                    String tiebaName = null;
+                    try {
+                        tiebaName = obj.getString("forum_name");
+                    } catch (Exception e) {
+                        tiebaName = obj.getString("name");
+                    }
+                    if (tiebaName == null) continue;
+
+                    String forumId = null;
+                    try {
+                        forumId = obj.getString("id");
+                    } catch (Exception ignored) {}
+                    try {
+                        if (forumId == null) {
+                            forumId = obj.getString("forum_id");
+                        }
+                    } catch (Exception ignored) {}
+
+                    String isSign = "0";
+                    try {
+                        isSign = obj.getString("is_sign");
+                    } catch (Exception ignored) {}
+
+                    // 检查贴吧是否存在
+                    if (Request.isTiebaNotExist(tiebaName)) {
+                        LOGGER.info("贴吧不存在，跳过: {}", tiebaName);
+                        continue;
+                    }
+
+                    if ("0".equals(isSign)) {
+                        forums.add(new ForumInfo(tiebaName, forumId));
+                    } else {
+                        alreadyCount++;
+                        LOGGER.info("PC端: 【{}】今日已签到", tiebaName);
+                    }
+                }
+
+                if (jsonArray.size() < perPage) {
+                    hasMore = false;
                 } else {
-                    // 将已经成功签到的贴吧，加入到 success
-                    success.add(tiebaName);
+                    page++;
+                    Thread.sleep(500);
                 }
             }
+
+            if (!forums.isEmpty()) {
+                followNum = forums.size() + alreadyCount;
+                LOGGER.info("PC端获取贴吧列表成功，共 {} 个贴吧，需签到 {} 个", followNum, forums.size());
+                hasForums = true;
+            } else if (alreadyCount > 0) {
+                followNum = alreadyCount;
+                LOGGER.info("PC端获取贴吧列表成功，全部 {} 个已签到", alreadyCount);
+                hasForums = true;
+            } else {
+                LOGGER.info("PC端未获取到需要签到的贴吧");
+            }
+
         } catch (Exception e) {
-            LOGGER.error("获取贴吧列表部分出现错误 -- " + e);
+            LOGGER.error("PC端获取贴吧列表出错 -- {}", e.getMessage());
+        }
+
+        // 阶段2: PC端为空，尝试移动端API
+        if (!hasForums) {
+            LOGGER.info("===== 阶段2: PC端为空，尝试移动端API获取 =====");
+            try {
+                int pageNo = 1;
+                boolean hasMore = true;
+
+                while (hasMore) {
+                    Map<String, String> data = new LinkedHashMap<>(CLIENT_PARAMS);
+                    data.put("BDUSS", Cookie.getInstance().getBDUSS());
+                    data.put("_client_id", "wappc_1534235498291_488");
+                    data.put("from", "1008621y");
+                    data.put("page_no", String.valueOf(pageNo));
+                    data.put("page_size", "200");
+                    data.put("timestamp", String.valueOf(System.currentTimeMillis() / 1000));
+                    data.put("vcode_tag", "11");
+
+                    String body = Encryption.encodeSign(data);
+                    JSONObject jsonObject = Request.postWithRetry(LIKE_URL_MOBILE, body, 3);
+
+                    if (jsonObject == null) {
+                        LOGGER.error("移动端获取第 {} 页贴吧列表失败", pageNo);
+                        break;
+                    }
+
+                    LOGGER.info("移动端获取第 {} 页贴吧列表", pageNo);
+
+                    try {
+                        JSONObject forumList = jsonObject.getJSONObject("forum_list");
+                        if (forumList != null) {
+                            for (String type : new String[]{"non-gconforum", "gconforum"}) {
+                                JSONArray items = forumList.getJSONArray(type);
+                                if (items != null && !items.isEmpty()) {
+                                    for (Object item : items) {
+                                        JSONObject forum = (JSONObject) item;
+                                        String name = forum.getString("name");
+                                        String id = forum.getString("id");
+                                        if (name != null && id != null) {
+                                            forums.add(new ForumInfo(name, id));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } catch (Exception e) {
+                        LOGGER.error("移动端解析贴吧列表出错 -- {}", e.getMessage());
+                    }
+
+                    String hasMoreStr = jsonObject.getString("has_more");
+                    if (!"1".equals(hasMoreStr)) {
+                        hasMore = false;
+                    } else {
+                        pageNo++;
+                        Thread.sleep(500 + new Random().nextInt(1500));
+                    }
+                }
+
+                if (!forums.isEmpty()) {
+                    followNum = forums.size();
+                    LOGGER.info("移动端获取贴吧列表成功，共 {} 个贴吧", followNum);
+                    hasForums = true;
+                } else {
+                    LOGGER.info("移动端也未获取到贴吧");
+                }
+
+            } catch (Exception e) {
+                LOGGER.error("移动端获取贴吧列表出错 -- {}", e.getMessage());
+            }
+        }
+
+        // 阶段3: 都为空，使用后备方式（单页PC端）
+        if (!hasForums) {
+            LOGGER.info("===== 阶段3: 前两阶段均为空，使用后备方式 =====");
+            try {
+                JSONObject jsonObject = Request.get(LIKE_URL);
+                LOGGER.info("使用后备方式获取贴吧列表");
+                JSONArray jsonArray = jsonObject.getJSONObject("data").getJSONArray("like_forum");
+                followNum = jsonArray.size();
+                for (Object array : jsonArray) {
+                    JSONObject obj = (JSONObject) array;
+                    String tiebaName = obj.getString("forum_name");
+                    if ("0".equals(obj.getString("is_sign"))) {
+                        followNames.add(tiebaName.replace("+", "%2B"));
+                    } else {
+                        alreadyCount++;
+                    }
+                }
+                LOGGER.info("后备方式获取贴吧成功，共 {} 个，需签到 {} 个", followNum, followNames.size());
+                hasForums = true;
+            } catch (Exception e2) {
+                LOGGER.error("后备方式也失败 -- {}", e2.getMessage());
+            }
+        }
+
+        if (!hasForums && forums.isEmpty() && followNames.isEmpty()) {
+            LOGGER.error("所有方式均未能获取到贴吧列表，请检查BDUSS是否有效");
         }
     }
 
     /**
-     * 开始进行签到，每一轮性将所有未签到的贴吧进行签到，一共进行5轮，如果还未签到完就立即结束
-     * 一般一次只会有少数的贴吧未能完成签到，为了减少接口访问次数，每一轮签到完等待1分钟，如果在过程中所有贴吧签到完则结束。
+     * 开始签到 - 有ID用移动端签名，无ID用PC端签名
      *
      * @author srcrs
      * @Time 2020-10-31
      */
     public void runSign() {
-        // 当执行 5 轮所有贴吧还未签到成功就结束操作
-        Integer flag = 5;
         try {
-            while (success.size() < followNum && flag > 0) {
-                LOGGER.info("-----第 {} 轮签到开始-----", 5 - flag + 1);
-                LOGGER.info("还剩 {} 贴吧需要签到", followNum - success.size());
-                Iterator<String> iterator = follow.iterator();
-                while (iterator.hasNext()) {
-                    String s = iterator.next();
-                    String rotation = s.replace("%2B", "+");
-                    String body = "kw=" + s + "&tbs=" + tbs + "&sign=" + Encryption.enCodeMd5("kw=" + rotation + "tbs=" + tbs + "tiebaclient!!!");
-                    JSONObject post = new JSONObject();
-                    post = Request.post(SIGN_URL, body);
-                    int randomTime = new Random().nextInt(200) + 300;
-                    LOGGER.info("等待 {} 毫秒", randomTime);
-                    TimeUnit.MILLISECONDS.sleep(randomTime);
-                    if ("0".equals(post.getString("error_code"))) {
-                        iterator.remove();
-                        success.add(rotation);
-                        failed.remove(rotation);
-                        LOGGER.info(rotation + ": " + "签到成功");
+            // 有ForumInfo（PC/移动端获取的带ID数据）→ 使用移动端签名
+            if (!forums.isEmpty()) {
+                LOGGER.info("使用移动端签名方式，开始签到 {} 个贴吧", forums.size());
+                for (int i = 0; i < forums.size(); i++) {
+                    ForumInfo forum = forums.get(i);
+                    String forumName = forum.name;
+                    String forumId = forum.id;
+
+                    Map<String, String> data = new LinkedHashMap<>(CLIENT_PARAMS);
+                    data.put("BDUSS", Cookie.getInstance().getBDUSS());
+                    data.put("fid", forumId != null ? forumId : "");
+                    data.put("kw", forumName);
+                    data.put("tbs", tbs);
+                    data.put("timestamp", String.valueOf(System.currentTimeMillis() / 1000));
+
+                    String body = Encryption.encodeSign(data);
+                    JSONObject result = Request.postWithRetry(SIGN_URL, body, 3);
+
+                    String errorCode = (result != null) ? result.getString("error_code") : null;
+                    if ("0".equals(errorCode)) {
+                        successCount++;
+                        try {
+                            String rank = result.getJSONObject("user_info").getString("user_sign_rank");
+                            LOGGER.info("【{}】吧({}/{}) 签到成功，第{}个签到", forumName, i + 1, forums.size(), rank);
+                        } catch (Exception e) {
+                            LOGGER.info("【{}】吧({}/{}) 签到成功", forumName, i + 1, forums.size());
+                        }
+                    } else if ("160002".equals(errorCode)) {
+                        alreadyCount++;
+                        LOGGER.info("【{}】吧({}/{}) 今日已签到", forumName, i + 1, forums.size());
+                    } else if ("340006".equals(errorCode)) {
+                        blockedCount++;
+                        LOGGER.warn("【{}】吧({}/{}) 贴吧已被屏蔽", forumName, i + 1, forums.size());
                     } else {
-                        failed.add(rotation);
-                        LOGGER.warn(rotation + ": " + "签到失败");
+                        errorCount++;
+                        String errorMsg = (result != null) ? result.getString("error_msg") : "请求失败";
+                        LOGGER.warn("【{}】吧({}/{}) 签到失败: {}", forumName, i + 1, forums.size(), errorMsg);
+                    }
+
+                    int delay = 1000 + new Random().nextInt(1500);
+                    TimeUnit.MILLISECONDS.sleep(delay);
+
+                    if ((i + 1) % 10 == 0 && i + 1 < forums.size()) {
+                        int extraSleep = 5000 + new Random().nextInt(5000);
+                        LOGGER.info("已签到 {}/{} 个贴吧，休息 {} 秒", i + 1, forums.size(), extraSleep / 1000.0);
+                        TimeUnit.MILLISECONDS.sleep(extraSleep);
                     }
                 }
-                if (success.size() != followNum - invalid.size()) {
-                    // 为防止短时间内多次请求接口，触发风控，设置每一轮签到完等待 5 分钟
-                    Thread.sleep(1000 * 60 * 5);
-                    /**
-                     * 重新获取 tbs
-                     * 尝试解决以前第 1 次签到失败，剩余 4 次循环都会失败的错误。
-                     */
-                    getTbs();
+
+            // 后备方式获取的无ID数据（followNames）→ 使用PC端MD5签名
+            } else if (!followNames.isEmpty()) {
+                LOGGER.info("使用PC端签名方式（后备），开始签到 {} 个贴吧", followNames.size());
+                Integer flag = 5;
+
+                while (!followNames.isEmpty() && flag > 0) {
+                    LOGGER.info("-----第 {} 轮签到开始-----", 5 - flag + 1);
+                    LOGGER.info("还剩 {} 贴吧需要签到", followNames.size());
+                    Iterator<String> iterator = followNames.iterator();
+                    while (iterator.hasNext()) {
+                        String s = iterator.next();
+                        String rotation = s.replace("%2B", "+");
+                        String body = "kw=" + s + "&tbs=" + tbs + "&sign="
+                                + Encryption.enCodeMd5("kw=" + rotation + "tbs=" + tbs + "tiebaclient!!!");
+                        JSONObject post = Request.post(SIGN_URL, body);
+                        int randomTime = new Random().nextInt(200) + 300;
+                        TimeUnit.MILLISECONDS.sleep(randomTime);
+                        if ("0".equals(post.getString("error_code"))) {
+                            iterator.remove();
+                            successCount++;
+                            LOGGER.info(rotation + ": " + "签到成功");
+                        } else {
+                            LOGGER.warn(rotation + ": " + "本轮签到失败，将重试");
+                        }
+                    }
+                    if (!followNames.isEmpty()) {
+                        flag--;
+                        if (flag > 0) {
+                            Thread.sleep(1000 * 60 * 5);
+                            getTbs();
+                        }
+                    }
                 }
-                flag--;
+                // 剩余未签到的计入失败
+                errorCount += followNames.size();
             }
         } catch (Exception e) {
             LOGGER.error("签到部分出现错误 -- " + e);
@@ -204,73 +445,26 @@ public class Run {
      * @author srcrs
      * @Time 2020-10-31
      */
-    /**   public void send(String sckey) {
-       
-        String text = "总: " + followNum + " - ";
-        text += "成功: " + success.size() + " 失败: " + (followNum - success.size());
-        String desp = "共 " + followNum + " 贴吧\n\n";
-        desp += "成功: " + success.size() + " 失败: " + (followNum - success.size());
-        String body = "text=" + text + "&desp=" + "TiebaSignIn运行结果\n\n" + desp;
-        StringEntity entityBody = new StringEntity(body, "UTF-8");
-        HttpClient client = HttpClients.createDefault();
-        HttpPost httpPost = new HttpPost("https://sc.ftqq.com/" + sckey + ".send");
-        httpPost.addHeader("Content-Type", "application/x-www-form-urlencoded");
-        httpPost.setEntity(entityBody);
-        HttpResponse resp = null;
-        String respContent = null;
+    public void send(String sckey) {
         try {
-            resp = client.execute(httpPost);
-            HttpEntity entity = null;
-            if (resp.getStatusLine().getStatusCode() < 400) {
-                entity = resp.getEntity();
-            } else {
-                entity = resp.getEntity();
-            }
-            respContent = EntityUtils.toString(entity, "UTF-8");
-            LOGGER.info("server酱推送正常");
+            String text = "总: " + followNum + " - ";
+            text += "成功: " + successCount + " 已签: " + alreadyCount
+                    + " 屏蔽: " + blockedCount + " 失败: " + errorCount;
+            String desp = "共 " + followNum + " 个贴吧\n\n";
+            desp += "成功: " + successCount + " 已签到: " + alreadyCount
+                    + " 屏蔽: " + blockedCount + " 失败: " + errorCount;
+            String body = "text=" + text + "&desp=" + "TiebaSignIn运行结果\n\n" + desp;
+            StringEntity entityBody = new StringEntity(body, "UTF-8");
+            HttpClient client = HttpClients.createDefault();
+            HttpPost httpPost = new HttpPost("https://sc.ftqq.com/" + sckey + ".send");
+            httpPost.addHeader("Content-Type", "application/x-www-form-urlencoded");
+            httpPost.setEntity(entityBody);
+            HttpResponse resp = client.execute(httpPost);
+            HttpEntity entity = resp.getEntity();
+            String respContent = EntityUtils.toString(entity, "UTF-8");
+            LOGGER.info("server酱发送成功 -- ");
         } catch (Exception e) {
             LOGGER.error("server酱发送失败 -- " + e);
-        }
-    } 
-**/
-      /**
-     * 发送运行结果到微信，通过 PUSHPLUS
-     *
-     * @param sckey
-     * @author srcrs
-     * @Time 2020-10-31
-     */
-     public void send(String sckey) {
-        /** 将要推送的数据 */
-        String text = "总: " + followNum + " - ";
-        text += "成功: " + success.size() + " 失败: " + (followNum - success.size());
-        String desp = "共 " + followNum + " 贴吧\n\n";
-        desp += "成功: " + success.size() + " 失败: " + (followNum - success.size());
-        String body = "text=" + text + "&desp=" + "TiebaSignIn运行结果\n\n" + desp;
-
-try {
-            String token = sckey;
-            String title = URLEncoder.encode("百度贴吧自动签到", "UTF-8");
-            String content = URLEncoder.encode(desp, "UTF-8");
-            String urlx = "https://www.pushplus.plus/send?title=" + title + "&content=" + content + "&token=" + token;
-            URL url = new URL(urlx);
-            HttpURLConnection connection = (HttpURLConnection) url.openConnection();
-            connection.setRequestMethod("GET");
-
-            BufferedReader reader = new BufferedReader(new InputStreamReader(connection.getInputStream()));
-            String line;
-            StringBuilder response = new StringBuilder();
-
-            while ((line = reader.readLine()) != null) {
-                response.append(line);
-            }
-            reader.close();
-
-            System.out.println("Response: " + response.toString());
-            connection.disconnect();
-
-        } catch (Exception e) {
-            e.printStackTrace();
         }
     }
 }
